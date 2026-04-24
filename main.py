@@ -2,6 +2,9 @@ import os
 import asyncio
 import sqlite3
 import aiohttp
+import json
+import re
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import yt_dlp
 from aiogram import Bot, Dispatcher, F, types
@@ -27,60 +30,71 @@ cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, prem_unti
 cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 db.commit()
 
-# --- ФУНКЦИЯ РАЗВОРАЧИВАНИЯ ССЫЛОК ---
-async def resolve_url(url):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, allow_redirects=True, timeout=10) as response:
-                return str(response.url)
-    except: return url
-
-# --- СКАЧИВАНИЕ ---
-def download_media(url, user_id):
-    tmp_dir = 'downloads'
-    if not os.path.exists(tmp_dir): os.makedirs(tmp_dir)
-
-    # Специальные настройки для обхода защиты Pinterest и Instagram
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': f'{tmp_dir}/{user_id}_%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'referer': 'https://www.pinterest.com/',
+# --- СПЕЦИАЛЬНЫЙ СКРАПЕР PINTEREST ---
+async def get_pinterest_media(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
     }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        # 1. Разворачиваем короткую ссылку
+        async with session.get(url, allow_redirects=True) as response:
+            full_url = str(response.url)
+            html = await response.text()
+        
+        # 2. Ищем данные в скрипте __PWS_DATA__
+        soup = BeautifulSoup(html, 'html.parser')
+        script_tag = soup.find("script", id="__PWS_DATA__")
+        
+        if script_tag:
+            try:
+                data = json.loads(script_tag.string)
+                # Копаем глубоко в JSON Пинтереста, чтобы найти MP4
+                pins = data.get('props', {}).get('initialProps', {}).get('data', {}).get('pin', {})
+                video_data = pins.get('videos', {}).get('video_list', {})
+                
+                # Пробуем найти V_720P или V_HLSV3 (но нам нужен именно mp4)
+                for key in ['V_720P', 'V_480P', 'V_360P']:
+                    if key in video_data:
+                        return video_data[key].get('url'), "video"
+            except: pass
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        path = ydl.prepare_filename(info)
+        # 3. Запасной вариант: ищем через мета-теги
+        video_meta = soup.find("meta", property="og:video:secure_url") or soup.find("meta", property="og:video")
+        if video_meta: return video_meta['content'], "video"
         
-        # Проверка: видео или фото
-        is_video = info.get('ext') in ['mp4', 'mkv', 'webm', 'mov']
-        size = os.path.getsize(path) / (1024 * 1024)
+        image_meta = soup.find("meta", property="og:image")
+        if image_meta: return image_meta['content'], "image"
         
-        return path, size, is_video
+    return None, None
+
+# --- ФУНКЦИЯ ЗАГРУЗКИ ФАЙЛА ---
+async def download_file(url, path):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                with open(path, 'wb') as f:
+                    f.write(await resp.read())
+                return True
+    return False
 
 # --- ПРИВЕТСТВИЕ ---
 @dp.message(Command("start"))
 async def start(message: Message):
     cur.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (message.from_user.id,))
     db.commit()
-    
     text = (
         "❤️ **Привет! Это бот для скачивания видео/фото/аудио из популярных социальных сетей.**\n\n"
         "🧐 **Как пользоваться:**\n"
-        "1. Зайди в одну из социальных сетей.\n"
-        "2. Выбери интересное видео/фото.\n"
-        "3. Нажми кнопку «Скопировать ссылку».\n"
-        "4. Отправь ссылку боту и получи скачанный файл!\n\n"
-        "🔗 **Бот может скачивать из:**\n"
-        "• YouTube Shorts\n• Instagram\n• TikTok\n• Pinterest\n\n"
-        "⚠️ **Внимание:** Лимит бесплатной загрузки — **50 МБ**.\n"
-        "💎 Для поддержки проекта купите Premium.\n\n"
+        "1. Зайди в одну из соцсетей.\n"
+        "2. Выбери видео или фото.\n"
+        "3. Скопируй ссылку.\n"
+        "4. Отправь её мне!\n\n"
+        "🔗 **Поддерживаю:** YouTube Shorts, Instagram, TikTok, Pinterest.\n"
+        "⚠️ **Лимит:** до 50 МБ.\n\n"
         f"{BOT_USERNAME}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Купить Premium", callback_data="buy_prem")],
+        [InlineKeyboardButton(text="💎 Premium", callback_data="buy_prem")],
         [InlineKeyboardButton(text="👨‍💻 Поддержка", url=f"tg://user?id={ADMIN_ID}")]
     ])
     await message.answer(text, reply_markup=kb, parse_mode="Markdown")
@@ -88,62 +102,59 @@ async def start(message: Message):
 # --- ОБРАБОТКА ССЫЛОК ---
 @dp.message(F.text.contains("http"))
 async def handle_link(message: Message):
-    # Проверка ОП (подписки)
+    # Обязательная подписка (ОП)
     ch_id = cur.execute("SELECT value FROM settings WHERE key='ch_id'").fetchone()
     if ch_id:
         try:
-            member = await bot.get_chat_member(ch_id[0], message.from_user.id)
-            if member.status == "left":
+            m = await bot.get_chat_member(ch_id[0], message.from_user.id)
+            if m.status == "left":
                 url = cur.execute("SELECT value FROM settings WHERE key='ch_url'").fetchone()[0]
                 kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Подписаться", url=url)]])
                 return await message.answer("❌ Сначала подпишись на канал!", reply_markup=kb)
         except: pass
 
-    # Лимит теперь 50 МБ для всех (максимум Telegram)
-    limit = 50
     status = await message.answer("⏳")
+    url = message.text
+    file_path = f"downloads/{message.from_user.id}_{datetime.now().timestamp()}"
 
     try:
-        url = await resolve_url(message.text)
-        
-        loop = asyncio.get_event_loop()
-        path, size, is_video = await loop.run_in_executor(None, download_media, url, message.from_user.id)
-        
-        if size > limit:
-            if os.path.exists(path): os.remove(path)
-            return await status.edit_text(f"⚠️ Файл слишком большой ({size:.1f} МБ).\nМаксимальный лимит Telegram: 50 МБ.")
+        # Если это Pinterest
+        if "pin.it" in url or "pinterest.com" in url:
+            direct_url, media_type = await get_pinterest_media(url)
+            if not direct_url:
+                return await status.edit_text("❌ Не удалось найти видео по этой ссылке.")
+            
+            ext = "mp4" if media_type == "video" else "jpg"
+            file_path += f".{ext}"
+            
+            if await download_file(direct_url, file_path):
+                if media_type == "video":
+                    await bot.send_video(message.chat.id, video=FSInputFile(file_path), caption=f"❤️ {BOT_USERNAME}")
+                    await bot.send_audio(message.chat.id, audio=FSInputFile(file_path), caption=f"🎵 Звук\n❤️ {BOT_USERNAME}")
+                else:
+                    await bot.send_photo(message.chat.id, photo=FSInputFile(file_path), caption=f"❤️ {BOT_USERNAME}")
+            else: raise Exception("Download failed")
 
-        if is_video:
-            # Отправляем видео
-            await bot.send_video(message.chat.id, video=FSInputFile(path), caption=f"❤️ {BOT_USERNAME}")
-            # Звуковая фишка (пробуем вытащить звук)
-            try:
-                await bot.send_audio(message.chat.id, audio=FSInputFile(path), caption=f"🎵 Звук из видео\n❤️ {BOT_USERNAME}")
-            except: pass
+        # Остальные соцсети (TikTok, YT, Insta) через yt-dlp
         else:
-            await bot.send_photo(message.chat.id, photo=FSInputFile(path), caption=f"❤️ {BOT_USERNAME}")
+            file_path += ".mp4"
+            ydl_opts = {'format': 'best[ext=mp4]/best', 'outtmpl': file_path, 'quiet': True}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, ydl.download, [url])
+            
+            await bot.send_video(message.chat.id, video=FSInputFile(file_path), caption=f"❤️ {BOT_USERNAME}")
+            await bot.send_audio(message.chat.id, audio=FSInputFile(file_path), caption=f"🎵 Звук\n❤️ {BOT_USERNAME}")
 
-        if os.path.exists(path): os.remove(path)
+        if os.path.exists(file_path): os.remove(file_path)
         await status.delete()
 
     except Exception as e:
-        await status.edit_text("❌ Ошибка загрузки. Возможно, это приватное видео или ссылка устарела.")
+        print(f"Error: {e}")
+        await status.edit_text("❌ Ошибка загрузки. Попробуйте другую ссылку.")
+        if os.path.exists(file_path): os.remove(file_path)
 
-# --- ОПЛАТА И АДМИНКА ---
-@dp.callback_query(F.data == "buy_prem")
-async def buy(call: types.CallbackQuery):
-    await bot.send_invoice(call.from_user.id, "Premium", "Поддержка проекта", "p", "XTR", [LabeledPrice(label="Оплата", amount=50)])
-
-@dp.pre_checkout_query()
-async def q(q: PreCheckoutQuery): await bot.answer_pre_checkout_query(q.id, ok=True)
-
-@dp.message(F.successful_payment)
-async def ok(message: Message):
-    date = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-    cur.execute("UPDATE users SET prem_until = ? WHERE id = ?", (date, message.from_user.id))
-    db.commit()
-    await message.answer(f"🎉 Спасибо за поддержку! Premium активен до {date}!")
-
+# --- АДМИНКА ---
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
 async def adm(message: Message):
     cur.execute("SELECT COUNT(*) FROM users")
@@ -167,6 +178,7 @@ async def sendall(message: Message):
         except: pass
 
 async def main():
+    if not os.path.exists('downloads'): os.makedirs('downloads')
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
