@@ -2,6 +2,8 @@ import os
 import asyncio
 import sqlite3
 import aiohttp
+import re
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import yt_dlp
 from aiogram import Bot, Dispatcher, F, types
@@ -27,47 +29,54 @@ cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, prem_unti
 cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 db.commit()
 
-# --- ФУНКЦИЯ РАЗВОРАЧИВАНИЯ ССЫЛОК (Для Pinterest) ---
+# --- ФУНКЦИЯ РАЗВОРАЧИВАНИЯ ССЫЛОК ---
 async def resolve_url(url):
-    if "pin.it" in url or "t.co" in url:
+    try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, allow_redirects=True) as response:
+            async with session.get(url, allow_redirects=True, timeout=10) as response:
                 return str(response.url)
-    return url
+    except: return url
 
-# --- ФУНКЦИЯ СКАЧИВАНИЯ ---
+# --- СПЕЦИАЛЬНЫЙ СКРАПЕР ДЛЯ PINTEREST (Если yt-dlp подведет) ---
+async def scrape_pinterest(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url) as response:
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                # Ищем видео в тегах
+                video_tag = soup.find("meta", property="og:video:secure_url") or soup.find("meta", property="og:video")
+                if video_tag: return video_tag['content'], "video"
+                
+                # Ищем фото в тегах
+                image_tag = soup.find("meta", property="og:image")
+                if image_tag: return image_tag['content'], "image"
+    except: return None, None
+
+# --- ГЛАВНАЯ ФУНКЦИЯ СКАЧИВАНИЯ ---
 def download_media(url, user_id):
     tmp_dir = 'downloads'
     if not os.path.exists(tmp_dir): os.makedirs(tmp_dir)
 
-    # Опции для видео
     v_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': f'{tmp_dir}/{user_id}_v.%(ext)s',
-        'quiet': True, 'no_warnings': True,
-    }
-    # Опции для аудио
-    a_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
-        'outtmpl': f'{tmp_dir}/{user_id}_a.%(ext)s',
+        'format': 'best', # Берем готовый файл, чтобы не требовать ffmpeg
+        'outtmpl': f'{tmp_dir}/{user_id}_%(id)s.%(ext)s',
         'quiet': True, 'no_warnings': True,
     }
 
     with yt_dlp.YoutubeDL(v_opts) as ydl:
-        v_info = ydl.extract_info(url, download=True)
-        v_path = ydl.prepare_filename(v_info)
+        info = ydl.extract_info(url, download=True)
+        v_path = ydl.prepare_filename(info)
+        
+        # Проверяем, видео это или фото
+        is_video = info.get('ext') in ['mp4', 'mkv', 'webm', 'mov']
         v_size = os.path.getsize(v_path) / (1024 * 1024)
-        is_video = v_info.get('ext') not in ['jpg', 'png', 'jpeg', 'webp']
+        
+        return v_path, v_size, is_video
 
-    with yt_dlp.YoutubeDL(a_opts) as ydl:
-        try:
-            a_info = ydl.extract_info(url, download=True)
-            a_path = ydl.prepare_filename(a_info)
-        except: a_path = None # Если звука нет (например, это просто фото)
-
-    return v_path, a_path, v_size, is_video
-
-# --- ПРИВЕТСТВИЕ (КАК НА КАРТИНКЕ) ---
+# --- ПРИВЕТСТВИЕ (ПО ТВОЕМУ ОБРАЗЦУ) ---
 @dp.message(Command("start"))
 async def start(message: Message):
     cur.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (message.from_user.id,))
@@ -85,8 +94,8 @@ async def start(message: Message):
         "• Instagram\n"
         "• TikTok\n"
         "• Pinterest\n\n"
-        "⚠️ **Внимание:** Лимит загрузки — **30 МБ**.\n"
-        "💎 Для видео до 50 МБ купите Premium.\n\n"
+        "⚠️ **Внимание:** Лимит бесплатной загрузки — **30 МБ**.\n"
+        "💎 Для видео до 50 МБ и поддержки проекта купите Premium.\n\n"
         f"{BOT_USERNAME}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -98,7 +107,7 @@ async def start(message: Message):
 # --- ОБРАБОТКА ССЫЛОК ---
 @dp.message(F.text.contains("http"))
 async def handle_link(message: Message):
-    # Проверка ОП (обязательной подписки)
+    # Проверка ОП
     ch_id = cur.execute("SELECT value FROM settings WHERE key='ch_id'").fetchone()
     if ch_id:
         try:
@@ -109,51 +118,48 @@ async def handle_link(message: Message):
                 return await message.answer("❌ Сначала подпишись на канал!", reply_markup=kb)
         except: pass
 
-    # Проверка лимитов
+    # Проверка лимита
     cur.execute("SELECT prem_until FROM users WHERE id = ?", (message.from_user.id,))
     res = cur.fetchone()
     is_prem = res[0] and datetime.strptime(res[0], '%Y-%m-%d %H:%M:%S') > datetime.now()
     limit = 50 if is_prem else 30
     
-    status_emoji = await message.answer("⏳")
+    status = await message.answer("⏳")
 
     try:
-        # Разворачиваем короткую ссылку
-        full_url = await resolve_url(message.text)
+        url = await resolve_url(message.text)
         
+        # Если это Pinterest, пробуем сначала скрапер для надежности
+        if "pinterest" in url or "pin.it" in url:
+            direct_url, p_type = await scrape_pinterest(url)
+            if direct_url: url = direct_url
+
         loop = asyncio.get_event_loop()
-        v_path, a_path, v_size, is_video = await loop.run_in_executor(None, download_media, full_url, message.from_user.id)
+        path, size, is_video = await loop.run_in_executor(None, download_media, url, message.from_user.id)
         
-        if v_size > limit:
-            if v_path and os.path.exists(v_path): os.remove(v_path)
-            if a_path and os.path.exists(a_path): os.remove(a_path)
-            return await status_emoji.edit_text(f"⚠️ Файл {v_size:.1f}МБ превышает лимит {limit}МБ.\n💎 Купите Premium!")
+        if size > limit:
+            os.remove(path)
+            return await status.edit_text(f"⚠️ Файл {size:.1f}МБ превышает ваш лимит {limit}МБ.")
 
-        # Отправка контента
         if is_video:
-            await bot.send_video(message.chat.id, video=FSInputFile(v_path), caption=f"❤️ {BOT_USERNAME}")
+            await bot.send_video(message.chat.id, video=FSInputFile(path), caption=f"❤️ {BOT_USERNAME}")
+            # ЗВУКОВАЯ ФИШКА: пробуем отправить и аудио
+            try:
+                await bot.send_audio(message.chat.id, audio=FSInputFile(path), caption=f"🎵 Звук из видео\n❤️ {BOT_USERNAME}")
+            except: pass
         else:
-            await bot.send_photo(message.chat.id, photo=FSInputFile(v_path), caption=f"❤️ {BOT_USERNAME}")
+            await bot.send_photo(message.chat.id, photo=FSInputFile(path), caption=f"❤️ {BOT_USERNAME}")
 
-        # Отправка звука (если есть)
-        if a_path and os.path.exists(a_path):
-            await bot.send_audio(message.chat.id, audio=FSInputFile(a_path), caption=f"❤️ {BOT_USERNAME}")
-
-        # Удаление
-        if v_path and os.path.exists(v_path): os.remove(v_path)
-        if a_path and os.path.exists(a_path): os.remove(a_path)
-        await status_emoji.delete()
+        os.remove(path)
+        await status.delete()
 
     except Exception as e:
-        await status_emoji.edit_text("❌ Видео не найдено или ссылка защищена.")
+        await status.edit_text("❌ Ошибка. Ссылка недоступна или защищена.")
 
-# --- АДМИНКА И ОПЛАТА (Без изменений) ---
+# --- ОПЛАТА И АДМИНКА ---
 @dp.callback_query(F.data == "buy_prem")
-async def pay(call: types.CallbackQuery):
-    await bot.send_invoice(
-        chat_id=call.from_user.id, title="Premium", description="Лимит 50МБ на 30 дней",
-        payload="p", currency="XTR", prices=[LabeledPrice(label="Оплата", amount=50)]
-    )
+async def buy(call: types.CallbackQuery):
+    await bot.send_invoice(call.from_user.id, "Premium", "Лимит 50МБ на 30 дней", "p", "XTR", [LabeledPrice(label="Оплата", amount=50)])
 
 @dp.pre_checkout_query()
 async def q(q: PreCheckoutQuery): await bot.answer_pre_checkout_query(q.id, ok=True)
@@ -163,25 +169,30 @@ async def ok(message: Message):
     date = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
     cur.execute("UPDATE users SET prem_until = ? WHERE id = ?", (date, message.from_user.id))
     db.commit()
-    await message.answer("🎉 Premium активирован!")
+    await message.answer(f"🎉 Premium активирован до {date}!")
 
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
 async def adm(message: Message):
     cur.execute("SELECT COUNT(*) FROM users")
-    await message.answer(f"📊 Юзеров: {cur.fetchone()[0]}\n`/setchannel ID URL` - ОП\n`/give ID` - Премиум\n`/send Текст` - Рассылка")
+    await message.answer(f"📊 Юзеров: {cur.fetchone()[0]}\n/setchannel ID URL\n/send Текст")
 
 @dp.message(Command("setchannel"), F.from_user.id == ADMIN_ID)
-async def set_ch(message: Message, command: CommandObject):
-    try:
-        args = command.args.split()
-        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ch_id', ?)", (args[0],))
-        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ch_url', ?)", (args[1],))
-        db.commit()
-        await message.answer("✅ Канал ОП обновлен")
-    except: await message.answer("Формат: `/setchannel -100xxx https://t.me/link`")
+async def setch(message: Message, command: CommandObject):
+    args = command.args.split()
+    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ch_id', ?), ('ch_url', ?)", (args[0], args[1]))
+    db.commit()
+    await message.answer("✅ Готово")
+
+@dp.message(Command("send"), F.from_user.id == ADMIN_ID)
+async def sendall(message: Message):
+    txt = message.text.replace("/send ", "")
+    cur.execute("SELECT id FROM users")
+    for u in cur.fetchall():
+        try: await bot.send_message(u[0], txt)
+        except: pass
 
 async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())         
