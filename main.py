@@ -2,6 +2,7 @@ import os
 import asyncio
 import sqlite3
 import yt_dlp
+import aiohttp
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
@@ -10,7 +11,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, F
 # --- НАСТРОЙКИ ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-BOT_USERNAME = "@HoardVideoBot" # Убедись, что имя совпадает
+BOT_USERNAME = "@HoardVideoBot" 
 
 DATA_DIR = "/app/data"
 if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
@@ -26,28 +27,41 @@ cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, prem_unti
 cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 db.commit()
 
-# --- УЛУЧШЕННАЯ ФУНКЦИЯ ЗАГРУЗКИ ---
+# --- ФУНКЦИЯ РАЗВОРАЧИВАНИЯ ССЫЛОК ---
+async def expand_url(url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, allow_redirects=True, timeout=10) as response:
+                return str(response.url)
+    except:
+        return url
+
+# --- УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ЗАГРУЗКИ ---
 async def download_media(url, user_id):
     if not os.path.exists('downloads'): os.makedirs('downloads')
+    
+    # Разворачиваем ссылку (особенно для pin.it)
+    full_url = await expand_url(url)
+    
     timestamp = int(datetime.now().timestamp())
     out_tmpl = f"downloads/{user_id}_{timestamp}.%(ext)s"
     
-    # Специальные настройки для вытягивания именно ВИДЕО
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', # Приоритет mp4 видео
+        # Пытаемся взять лучшее видео, игнорируя только картинки
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': out_tmpl,
         'quiet': True,
         'no_warnings': True,
         'merge_output_format': 'mp4',
         'headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
-        }
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        },
+        'noplaylist': True,
     }
 
     def extract():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Сначала получаем инфо, чтобы понять, видео это или фото
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(full_url, download=True)
             return ydl.prepare_filename(info)
 
     loop = asyncio.get_event_loop()
@@ -55,7 +69,7 @@ async def download_media(url, user_id):
         file_path = await loop.run_in_executor(None, extract)
         return file_path
     except Exception as e:
-        print(f"Ошибка загрузки: {e}")
+        print(f"Ошибка YT-DLP: {e}")
         return None
 
 # --- КРАСИВОЕ ПРИВЕТСТВИЕ ---
@@ -64,36 +78,30 @@ async def start(message: Message):
     cur.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (message.from_user.id,))
     db.commit()
     
-    # Текст как на скриншоте
     welcome_text = (
         "❤️ **Привет! Это бот для скачивания видео/фото/аудио из популярных социальных сетей.**\n\n"
         "🧐 **Как пользоваться:**\n"
         "1. Зайди в одну из социальных сетей.\n"
-        "2. Выбери интересное видео/фото.\n"
-        "3. Нажми кнопку «Скопировать ссылку».\n"
-        "4. Отправь ссылку боту и получи скачанный файл!\n\n"
-        "🔗 **Бот может скачивать из:**\n"
-        "• YouTube\n"
-        "• Instagram\n"
+        "2. Выбери интересное видео или фото.\n"
+        "3. Нажми кнопку **«Скопировать ссылку»**.\n"
+        "4. Отправь ссылку мне и получи файл!\n\n"
+        "🔗 **Бот поддерживает:**\n"
+        "• YouTube Shorts\n"
+        "• Instagram Reels\n"
         "• TikTok\n"
-        "• Pinterest\n\n"
-        f"{BOT_USERNAME}"
+        "• **Pinterest (Video & Photo)**\n\n"
+        f"👤 {BOT_USERNAME}"
     )
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Premium", callback_data="buy_prem")],
         [InlineKeyboardButton(text="👨‍💻 Поддержка", url=f"tg://user?id={ADMIN_ID}")]
     ])
-    
-    # Если хочешь добавить картинку сверху, раскомментируй строку ниже и вставь прямую ссылку на фото
-    # await message.answer_photo(photo="ССЫЛКА_НА_ТВОЁ_ЛОГО", caption=welcome_text, reply_markup=kb, parse_mode="Markdown")
-    
     await message.answer(welcome_text, reply_markup=kb, parse_mode="Markdown")
 
 # --- ОБРАБОТКА ССЫЛОК ---
 @dp.message(F.text.contains("http"))
 async def handle_link(message: Message):
-    # Обязательная подписка (ОП)
+    # Проверка ОП (подписки)
     ch_id_data = cur.execute("SELECT value FROM settings WHERE key='ch_id'").fetchone()
     if ch_id_data:
         try:
@@ -104,7 +112,7 @@ async def handle_link(message: Message):
                 return await message.answer("❌ Сначала подпишись на канал!", reply_markup=kb)
         except: pass
 
-    status = await message.answer("⏳ **Загрузка началась...**", parse_mode="Markdown")
+    status = await message.answer("⏳ **Загрузка медиа...**", parse_mode="Markdown")
     url = message.text.strip()
     file_path = None
 
@@ -112,14 +120,10 @@ async def handle_link(message: Message):
         file_path = await download_media(url, message.from_user.id)
         
         if not file_path or not os.path.exists(file_path):
-            return await status.edit_text("❌ Ошибка: Не удалось получить видео. Возможно, это приватная запись.")
-
-        # Проверка размера (Лимит Telegram для ботов 50мб)
-        if os.path.getsize(file_path) > 50 * 1024 * 1024:
-            return await status.edit_text("⚠️ Файл слишком большой (более 50 МБ).")
+            return await status.edit_text("❌ Не удалось скачать. Попробуйте другую ссылку.")
 
         # Отправка видео
-        if file_path.lower().endswith(('.mp4', '.mov', '.webm')):
+        if file_path.lower().endswith(('.mp4', '.mov', '.webm', '.mkv')):
             await bot.send_video(
                 message.chat.id, 
                 video=FSInputFile(file_path), 
@@ -127,7 +131,7 @@ async def handle_link(message: Message):
                 parse_mode="Markdown"
             )
         # Отправка фото
-        elif file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+        elif file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
             await bot.send_photo(
                 message.chat.id, 
                 photo=FSInputFile(file_path), 
@@ -141,11 +145,12 @@ async def handle_link(message: Message):
 
     except Exception as e:
         print(f"Error: {e}")
-        await status.edit_text(f"❌ Произошла ошибка. Попробуйте другую ссылку.")
+        await status.edit_text("❌ Произошла ошибка. Попробуйте еще раз.")
     
     finally:
         if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+            try: os.remove(file_path)
+            except: pass
 
 # --- АДМИНКА ---
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
@@ -160,21 +165,17 @@ async def setch(message: Message, command: CommandObject):
         args = command.args.split()
         cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ch_id', ?), ('ch_url', ?)", (args[0], args[1]))
         db.commit()
-        await message.answer("✅ Канал для подписки сохранен!")
-    except: await message.answer("Формат: `/setchannel -100123 https://t.me/link`")
+        await message.answer("✅ Канал установлен")
+    except: await message.answer("Формат: `/setchannel -100 ID URL`")
 
 @dp.message(Command("send"), F.from_user.id == ADMIN_ID)
 async def sendall(message: Message):
     txt = message.text.replace("/send ", "")
     cur.execute("SELECT id FROM users")
-    users = cur.fetchall()
-    await message.answer(f"🚀 Начинаю рассылку на {len(users)} чел...")
-    for u in users:
-        try: 
-            await bot.send_message(u[0], txt)
-            await asyncio.sleep(0.05)
+    for u in cur.fetchall():
+        try: await bot.send_message(u[0], txt)
         except: pass
-    await message.answer("✅ Рассылка завершена!")
+    await message.answer("✅ Рассылка завершена")
 
 async def main():
     if not os.path.exists('downloads'): os.makedirs('downloads')
