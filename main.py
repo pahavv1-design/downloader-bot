@@ -27,7 +27,7 @@ cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, prem_unti
 cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 db.commit()
 
-# --- ФУНКЦИЯ РАЗВОРАЧИВАНИЯ ССЫЛОК ---
+# --- РАЗВОРАЧИВАНИЕ КОРОТКИХ ССЫЛОК ---
 async def expand_url(url):
     try:
         async with aiohttp.ClientSession() as session:
@@ -36,23 +36,22 @@ async def expand_url(url):
     except:
         return url
 
-# --- УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ЗАГРУЗКИ ---
+# --- ЗАГРУЗКА МЕДИА ---
 async def download_media(url, user_id):
     if not os.path.exists('downloads'): os.makedirs('downloads')
     
-    # Разворачиваем ссылку (особенно для pin.it)
+    # Разворачиваем pin.it
     full_url = await expand_url(url)
     
     timestamp = int(datetime.now().timestamp())
     out_tmpl = f"downloads/{user_id}_{timestamp}.%(ext)s"
     
+    # ИСПРАВЛЕННЫЙ ФОРМАТ: 'best' — самый надежный для Pinterest
     ydl_opts = {
-        # Пытаемся взять лучшее видео, игнорируя только картинки
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'best', 
         'outtmpl': out_tmpl,
         'quiet': True,
         'no_warnings': True,
-        'merge_output_format': 'mp4',
         'headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
         },
@@ -81,19 +80,20 @@ async def start(message: Message):
     welcome_text = (
         "❤️ **Привет! Это бот для скачивания видео/фото/аудио из популярных социальных сетей.**\n\n"
         "🧐 **Как пользоваться:**\n"
-        "1. Зайди в одну из социальных сетей.\n"
-        "2. Выбери интересное видео или фото.\n"
-        "3. Нажми кнопку **«Скопировать ссылку»**.\n"
-        "4. Отправь ссылку мне и получи файл!\n\n"
+        "1️⃣ Зайди в соцсеть (TikTok, Instagram и др.).\n"
+        "2️⃣ Выбери интересное видео или фото.\n"
+        "3️⃣ Нажми кнопку **«Скопировать ссылку»**.\n"
+        "4️⃣ Отправь ссылку мне и жди файл!\n\n"
         "🔗 **Бот поддерживает:**\n"
-        "• YouTube Shorts\n"
-        "• Instagram Reels\n"
-        "• TikTok\n"
-        "• **Pinterest (Video & Photo)**\n\n"
+        "• YouTube Shorts 📺\n"
+        "• Instagram Reels 📸\n"
+        "• TikTok 🎵\n"
+        "• Pinterest 📌\n\n"
         f"👤 {BOT_USERNAME}"
     )
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Premium", callback_data="buy_prem")],
         [InlineKeyboardButton(text="👨‍💻 Поддержка", url=f"tg://user?id={ADMIN_ID}")]
     ])
     await message.answer(welcome_text, reply_markup=kb, parse_mode="Markdown")
@@ -101,7 +101,7 @@ async def start(message: Message):
 # --- ОБРАБОТКА ССЫЛОК ---
 @dp.message(F.text.contains("http"))
 async def handle_link(message: Message):
-    # Проверка ОП (подписки)
+    # Проверка подписки (ОП)
     ch_id_data = cur.execute("SELECT value FROM settings WHERE key='ch_id'").fetchone()
     if ch_id_data:
         try:
@@ -112,7 +112,7 @@ async def handle_link(message: Message):
                 return await message.answer("❌ Сначала подпишись на канал!", reply_markup=kb)
         except: pass
 
-    status = await message.answer("⏳ **Загрузка медиа...**", parse_mode="Markdown")
+    status = await message.answer("⏳ **Загрузка началась...**", parse_mode="Markdown")
     url = message.text.strip()
     file_path = None
 
@@ -120,10 +120,11 @@ async def handle_link(message: Message):
         file_path = await download_media(url, message.from_user.id)
         
         if not file_path or not os.path.exists(file_path):
-            return await status.edit_text("❌ Не удалось скачать. Попробуйте другую ссылку.")
+            return await status.edit_text("❌ Не удалось скачать файл. Ссылка может быть битой или приватной.")
 
+        ext = file_path.lower()
         # Отправка видео
-        if file_path.lower().endswith(('.mp4', '.mov', '.webm', '.mkv')):
+        if ext.endswith(('.mp4', '.mov', '.webm', '.mkv')):
             await bot.send_video(
                 message.chat.id, 
                 video=FSInputFile(file_path), 
@@ -131,7 +132,7 @@ async def handle_link(message: Message):
                 parse_mode="Markdown"
             )
         # Отправка фото
-        elif file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+        elif ext.endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
             await bot.send_photo(
                 message.chat.id, 
                 photo=FSInputFile(file_path), 
@@ -145,9 +146,10 @@ async def handle_link(message: Message):
 
     except Exception as e:
         print(f"Error: {e}")
-        await status.edit_text("❌ Произошла ошибка. Попробуйте еще раз.")
+        await status.edit_text("❌ Произошла ошибка. Попробуйте еще раз позже.")
     
     finally:
+        # Удаление временного файла
         if file_path and os.path.exists(file_path):
             try: os.remove(file_path)
             except: pass
@@ -165,7 +167,7 @@ async def setch(message: Message, command: CommandObject):
         args = command.args.split()
         cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ch_id', ?), ('ch_url', ?)", (args[0], args[1]))
         db.commit()
-        await message.answer("✅ Канал установлен")
+        await message.answer("✅ Канал для подписки успешно установлен.")
     except: await message.answer("Формат: `/setchannel -100 ID URL`")
 
 @dp.message(Command("send"), F.from_user.id == ADMIN_ID)
@@ -175,7 +177,7 @@ async def sendall(message: Message):
     for u in cur.fetchall():
         try: await bot.send_message(u[0], txt)
         except: pass
-    await message.answer("✅ Рассылка завершена")
+    await message.answer("✅ Рассылка завершена.")
 
 async def main():
     if not os.path.exists('downloads'): os.makedirs('downloads')
