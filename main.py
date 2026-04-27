@@ -2,13 +2,12 @@ import os
 import asyncio
 import sqlite3
 import aiohttp
-import re
-import random
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 
+# ---------------- НАСТРОЙКИ ----------------
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 BOT_USERNAME = "@HoardVideoBot"
@@ -22,111 +21,119 @@ cur = db.cursor()
 cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
 db.commit()
 
-# -------- СПИСОК БЕСПЛАТНЫХ ПРОКСИ --------
-PROXIES = [
-    "http://51.158.68.68:8811",
-    "http://51.79.144.52:3128",
-    "http://163.172.182.164:3128",
-    "http://8.219.97.248:80",
-    "http://20.111.54.16:8123",
-]
+# ---------------- COBALT API ЧЕРЕЗ GATEWAY ----------------
+async def get_media_link(url):
+    api_url = "https://cors.isomorphic-git.org/https://api.cobalt.tools/api/json"
 
-# -------- ПОЛУЧЕНИЕ PINTEREST VIDEO --------
-async def get_pinterest_video(url):
-    proxy = random.choice(PROXIES)
+    payload = {
+        "url": url,
+        "vQuality": "720",
+        "isAudioOnly": False
+    }
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
 
     try:
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=40)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(api_url, json=payload, headers=headers) as response:
+                if response.status != 200:
+                    print("Cobalt status:", response.status)
+                    return None
 
-        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                data = await response.json()
 
-            # Разворачиваем pin.it
-            async with session.get(url, allow_redirects=True, proxy=proxy) as resp:
-                final_url = str(resp.url)
-
-            final_url = final_url.replace("www.pinterest.com", "m.pinterest.com")
-
-            async with session.get(final_url, proxy=proxy) as resp:
-                html = await resp.text()
-
-            # Ищем mp4
-            match = re.search(r'https://v\d\.pinimg\.com/videos/.*?\.mp4', html)
-
-            if match:
-                return match.group(0)
+                # статус stream или redirect
+                if "url" in data:
+                    return data["url"]
 
     except Exception as e:
-        print("Proxy error:", e)
+        print("Cobalt error:", e)
 
     return None
 
 
-# -------- СКАЧИВАНИЕ --------
+# ---------------- СКАЧИВАНИЕ ФАЙЛА ----------------
 async def download_file(url, filename):
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     with open(filename, "wb") as f:
                         f.write(await resp.read())
                     return True
-    except:
-        pass
+    except Exception as e:
+        print("Download error:", e)
+
     return False
 
 
-# -------- START --------
+# ---------------- START ----------------
 @dp.message(Command("start"))
 async def start(message: Message):
     cur.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (message.from_user.id,))
     db.commit()
 
     text = (
-        "🔥 **Pinterest Downloader (Proxy Mode)**\n\n"
-        "📌 Отправь ссылку на Pinterest — попробуем обойти блокировку.\n\n"
-        "✅ Работает через прокси\n"
+        "🔥 **Универсальный загрузчик видео**\n\n"
+        "📌 Отправь ссылку — получишь файл.\n\n"
+        "Поддержка:\n"
+        "• YouTube Shorts 📺\n"
+        "• Instagram Reels 📸\n"
+        "• TikTok 🎵\n"
+        "• Pinterest 📌\n\n"
         f"{BOT_USERNAME}"
     )
 
-    await message.answer(text, parse_mode="Markdown")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👨‍💻 Поддержка", url=f"tg://user?id={ADMIN_ID}")]
+    ])
+
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
 
 
-# -------- ОБРАБОТКА --------
+# ---------------- ОБРАБОТКА ССЫЛОК ----------------
 @dp.message(F.text.contains("http"))
 async def handle_link(message: Message):
 
-    status = await message.answer("⏳ Пытаюсь через прокси...")
+    status = await message.answer("⏳ Получаю видео...")
 
     url = message.text.strip()
     filename = f"{message.from_user.id}_{int(datetime.now().timestamp())}.mp4"
 
     try:
-        video_url = await get_pinterest_video(url)
+        media_url = await get_media_link(url)
 
-        if not video_url:
-            return await status.edit_text("❌ Не удалось получить видео через прокси.")
+        if not media_url:
+            return await status.edit_text("❌ Не удалось получить видео. Возможно сервис временно недоступен.")
 
-        success = await download_file(video_url, filename)
+        success = await download_file(media_url, filename)
 
         if not success:
             return await status.edit_text("❌ Ошибка скачивания файла.")
 
-        await bot.send_video(message.chat.id, FSInputFile(filename))
+        await bot.send_video(
+            message.chat.id,
+            FSInputFile(filename),
+            caption=f"✅ Готово!\n❤️ {BOT_USERNAME}"
+        )
+
         await status.delete()
 
     except Exception as e:
-        print(e)
-        await status.edit_text("❌ Ошибка.")
+        print("Main error:", e)
+        await status.edit_text("❌ Произошла ошибка.")
 
     finally:
         if os.path.exists(filename):
             os.remove(filename)
 
 
+# ---------------- ЗАПУСК ----------------
 async def main():
     await dp.start_polling(bot)
 
