@@ -1,140 +1,106 @@
-import os
-import asyncio
-import sqlite3
-import aiohttp
-from datetime import datetime
-from aiogram import Bot, Dispatcher, F
+import os, asyncio, yt_dlp, subprocess
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.types import Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from database import init_db, add_user, check_limit, increment_limit, get_stats, get_all_users
 
-# ---------------- НАСТРОЙКИ ----------------
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-BOT_USERNAME = "@HoardVideoBot"
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+DAILY_LIMIT = 5 
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ---------------- БАЗА ----------------
-db = sqlite3.connect("bot.db")
-cur = db.cursor()
-cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
-db.commit()
+# Функция сжатия видео
+def compress_video(input_path, output_path):
+    # Сжимаем видео до ~45МБ используя кодек libx264
+    cmd = [
+        'ffmpeg', '-i', input_path, '-vcodec', 'libx264', '-crf', '28', 
+        '-preset', 'ultrafast', '-fs', '45M', '-y', output_path
+    ]
+    subprocess.run(cmd)
 
-# ---------------- COBALT API ЧЕРЕЗ GATEWAY ----------------
-async def get_media_link(url):
-    api_url = "https://cors.isomorphic-git.org/https://api.cobalt.tools/api/json"
-
-    payload = {
-        "url": url,
-        "vQuality": "720",
-        "isAudioOnly": False
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-
-    try:
-        timeout = aiohttp.ClientTimeout(total=40)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(api_url, json=payload, headers=headers) as response:
-                if response.status != 200:
-                    print("Cobalt status:", response.status)
-                    return None
-
-                data = await response.json()
-
-                # статус stream или redirect
-                if "url" in data:
-                    return data["url"]
-
-    except Exception as e:
-        print("Cobalt error:", e)
-
-    return None
-
-
-# ---------------- СКАЧИВАНИЕ ФАЙЛА ----------------
-async def download_file(url, filename):
-    try:
-        timeout = aiohttp.ClientTimeout(total=60)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    with open(filename, "wb") as f:
-                        f.write(await resp.read())
-                    return True
-    except Exception as e:
-        print("Download error:", e)
-
-    return False
-
-
-# ---------------- START ----------------
 @dp.message(Command("start"))
-async def start(message: Message):
-    cur.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (message.from_user.id,))
-    db.commit()
+async def start(message: types.Message):
+    add_user(message.from_user.id)
+    await message.answer(f"👋 Привет! Пришли ссылку на YouTube, TikTok, Reels или Pinterest.\n\n"
+                         f"📊 Твой лимит: {DAILY_LIMIT} видео в день.\n"
+                         "Я могу скачать как видео, так и звук!")
 
-    text = (
-        "🔥 **Универсальный загрузчик видео**\n\n"
-        "📌 Отправь ссылку — получишь файл.\n\n"
-        "Поддержка:\n"
-        "• YouTube Shorts 📺\n"
-        "• Instagram Reels 📸\n"
-        "• TikTok 🎵\n"
-        "• Pinterest 📌\n\n"
-        f"{BOT_USERNAME}"
-    )
+@dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
+async def admin(message: types.Message):
+    await message.answer(f"📊 Юзеров: {get_stats()}\nРассылка: `/send текст`")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👨‍💻 Поддержка", url=f"tg://user?id={ADMIN_ID}")]
-    ])
+@dp.message(Command("send"), F.from_user.id == ADMIN_ID)
+async def broadcast(message: types.Message):
+    text = message.text.replace("/send ", "")
+    for u_id in get_all_users():
+        try: await bot.send_message(u_id, text)
+        except: pass
+    await message.answer("✅ Готово")
 
-    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+@dp.message(F.text.startswith("http"))
+async def pre_download(message: types.Message):
+    if not check_limit(message.from_user.id, DAILY_LIMIT):
+        return await message.answer("❌ Лимит на сегодня исчерпан!")
+    
+    kb = InlineKeyboardBuilder()
+    kb.row(types.InlineKeyboardButton(text="🎥 Видео", callback_data=f"dl_video_{message.text}"))
+    kb.row(types.InlineKeyboardButton(text="🎵 Звук (MP3)", callback_data=f"dl_audio_{message.text}"))
+    await message.answer("Что скачиваем?", reply_markup=kb.as_markup())
 
-
-# ---------------- ОБРАБОТКА ССЫЛОК ----------------
-@dp.message(F.text.contains("http"))
-async def handle_link(message: Message):
-
-    status = await message.answer("⏳ Получаю видео...")
-
-    url = message.text.strip()
-    filename = f"{message.from_user.id}_{int(datetime.now().timestamp())}.mp4"
-
+@dp.callback_query(F.data.startswith("dl_"))
+async def download_logic(callback: types.CallbackQuery):
+    data = callback.data.split("_")
+    mode = data[1]
+    url = data[2]
+    user_id = callback.from_user.id
+    
+    await callback.message.edit_text("⏳ Начинаю загрузку...")
+    
+    folder = f"dl_{user_id}"
+    if not os.path.exists(folder): os.makedirs(folder)
+    
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best' if mode == 'video' else 'bestaudio/best',
+        'outtmpl': f'{folder}/file.%(ext)s',
+        'noplaylist': True,
+    }
+    
     try:
-        media_url = await get_media_link(url)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_path = ydl.prepare_filename(info)
 
-        if not media_url:
-            return await status.edit_text("❌ Не удалось получить видео. Возможно сервис временно недоступен.")
+        # Если скачиваем видео
+        if mode == 'video':
+            size = os.path.getsize(file_path) / (1024 * 1024)
+            if size > 49:
+                await callback.message.edit_text("⚙️ Видео тяжелое, сжимаю...")
+                compressed_path = f"{folder}/compressed.mp4"
+                compress_video(file_path, compressed_path)
+                file_path = compressed_path
+            
+            await bot.send_video(user_id, types.FSInputFile(file_path), caption="✅ Видео готово!")
+        
+        # Если скачиваем звук
+        else:
+            audio_path = f"{folder}/audio.mp3"
+            subprocess.run(['ffmpeg', '-i', file_path, '-q:a', '0', '-map', 'a', audio_path, '-y'])
+            await bot.send_audio(user_id, types.FSInputFile(audio_path), caption="🎵 Звук извлечен!")
 
-        success = await download_file(media_url, filename)
-
-        if not success:
-            return await status.edit_text("❌ Ошибка скачивания файла.")
-
-        await bot.send_video(
-            message.chat.id,
-            FSInputFile(filename),
-            caption=f"✅ Готово!\n❤️ {BOT_USERNAME}"
-        )
-
-        await status.delete()
-
+        increment_limit(user_id)
+        await callback.message.delete()
+        
     except Exception as e:
-        print("Main error:", e)
-        await status.edit_text("❌ Произошла ошибка.")
+        await callback.message.edit_text(f"❌ Ошибка. Возможно, видео защищено или слишком длинное.")
+    
+    # Очистка
+    for f in os.listdir(folder): os.remove(os.path.join(folder, f))
+    os.rmdir(folder)
 
-    finally:
-        if os.path.exists(filename):
-            os.remove(filename)
-
-
-# ---------------- ЗАПУСК ----------------
 async def main():
+    init_db()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
